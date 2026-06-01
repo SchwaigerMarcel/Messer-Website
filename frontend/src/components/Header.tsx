@@ -29,7 +29,7 @@ export function Header() {
           {/* Logo Section */}
           <Link to="/" className="flex items-center gap-2 sm:gap-5 group min-w-0 flex-shrink">
             <img
-              src="api/images/page/logo.svg"
+              src="/api/images/page/logo.svg"
               alt="Logo"
               className="w-8 h-8 sm:w-10 sm:h-10 flex-shrink-0" /* Kleiner auf Mobile */
               style={{ marginBottom: "4px" }}

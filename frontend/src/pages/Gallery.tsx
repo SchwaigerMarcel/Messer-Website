@@ -6,6 +6,10 @@ import { motion } from "framer-motion";
 const GAP = 12;
 const MEDIA_BASE = "https://messerschmiede-schwaiger.at/api/images/gallery";
 
+// How many images to preload ahead of the last fully-loaded one.
+// 1 = strictly sequential, 2-3 = slight look-ahead for smoother UX.
+const PRELOAD_AHEAD = 2;
+
 function getColumnCount(width: number): number {
   if (width < 640) return 1;
   if (width < 1024) return 2;
@@ -18,6 +22,29 @@ function debounce<T extends (...args: never[]) => void>(fn: T, ms: number): T {
     clearTimeout(t);
     t = setTimeout(() => fn(...args), ms);
   }) as T;
+}
+
+// ─── Sequential Loader ────────────────────────────────────────────────────────
+// Manages which indices are allowed to start loading.
+// loadedUpTo = highest index that has fully loaded.
+// allowedUpTo = loadedUpTo + PRELOAD_AHEAD (next items are pre-fetched).
+
+function useSequentialLoader(total: number) {
+  // Index of the highest item that has finished loading (-1 = nothing done yet)
+  const [loadedUpTo, setLoadedUpTo] = useState(-1);
+
+  const markLoaded = useCallback((index: number) => {
+    setLoadedUpTo((prev) => {
+      // Only advance if this is the next expected item.
+      // Out-of-order completions (e.g. cached images) advance to their index.
+      return Math.max(prev, index);
+    });
+  }, []);
+
+  // How far ahead we allow loading
+  const allowedUpTo = Math.min(loadedUpTo + PRELOAD_AHEAD, total - 1);
+
+  return { allowedUpTo, markLoaded };
 }
 
 // ─── Layout Engine ────────────────────────────────────────────────────────────
@@ -64,30 +91,36 @@ function computeLayout(
 interface MediaCardProps {
   src: string;
   index: number;
-  onHeight: (index: number, height: number) => void;
+  /** Whether this item is allowed to start loading yet */
+  canLoad: boolean;
+  /** Called once the media has fully loaded and has a real height */
+  onReady: (index: number, height: number) => void;
+  /** Show the visible card (true) or the invisible probe (false) */
+  visible?: boolean;
 }
 
-function MediaCard({ src, index, onHeight }: MediaCardProps) {
+function MediaCard({ src, index, canLoad, onReady, visible = true }: MediaCardProps) {
   const ref = useRef<HTMLImageElement & HTMLVideoElement>(null);
-  const reported = useRef(false);
+  const reportedHeight = useRef(-1);
+  const [fullyLoaded, setFullyLoaded] = useState(false);
 
-  const fullSrc = `${MEDIA_BASE}/${src}`;
   const lowerSrc = src.toLowerCase();
   const isVideo =
     lowerSrc.endsWith(".mp4") ||
     lowerSrc.endsWith(".webm") ||
     lowerSrc.endsWith(".mov");
 
+  // Report height once the element has real dimensions in the DOM
   useEffect(() => {
+    if (!canLoad) return;
     const el = ref.current;
     if (!el) return;
 
     const tryReport = () => {
-      if (reported.current) return;
       const h = el.getBoundingClientRect().height;
-      if (h > 0) {
-        reported.current = true;
-        onHeight(index, h);
+      if (h > 0 && h !== reportedHeight.current) {
+        reportedHeight.current = h;
+        onReady(index, h);
       }
     };
 
@@ -97,7 +130,21 @@ function MediaCard({ src, index, onHeight }: MediaCardProps) {
 
     return () => ro.disconnect();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [canLoad]);
+
+  const fullSrc = canLoad ? `${MEDIA_BASE}/${src}` : undefined;
+
+  const handleLoad = () => {
+    setFullyLoaded(true);
+    const el = ref.current;
+    if (el) {
+      const h = el.getBoundingClientRect().height;
+      if (h > 0) {
+        reportedHeight.current = h;
+        onReady(index, h);
+      }
+    }
+  };
 
   if (isVideo) {
     return (
@@ -105,11 +152,14 @@ function MediaCard({ src, index, onHeight }: MediaCardProps) {
         ref={ref}
         src={fullSrc}
         className="block w-full rounded-md"
+        style={visible ? { opacity: fullyLoaded ? 1 : 0, transition: "opacity 0s" } : undefined}
         muted
         loop
         playsInline
         autoPlay
-        preload="metadata"
+        preload={canLoad ? "metadata" : "none"}
+        onLoadedMetadata={handleLoad}
+        onCanPlay={handleLoad}
       />
     );
   }
@@ -119,9 +169,12 @@ function MediaCard({ src, index, onHeight }: MediaCardProps) {
       ref={ref}
       src={fullSrc}
       alt={`Galerie ${index + 1}`}
-      loading="lazy"
-      decoding="async"
+      decoding="sync"
       className="block w-full rounded-md"
+      // Hidden until fully decoded — no progressive pixel rows
+      style={visible ? { opacity: fullyLoaded ? 1 : 0, transition: "opacity 0s" } : undefined}
+      onLoad={handleLoad}
+      onError={handleLoad} // also unblock queue on error
     />
   );
 }
@@ -133,22 +186,21 @@ interface MasonryGridProps {
 }
 
 function MasonryGrid({ media }: MasonryGridProps) {
-  // sentinelRef: a normal in-flow div that gives us the real container width.
-  // This is separate from the probe container so nothing interferes with it.
   const sentinelRef = useRef<HTMLDivElement>(null);
 
   const [containerWidth, setContainerWidth] = useState(0);
   const [columnCount, setColumnCount] = useState(0);
 
-  // Measured heights. Key = item index. Reset when columnCount changes.
   const heights = useRef<Map<number, number>>(new Map());
-  // Track which columnCount the heights belong to, to discard stale callbacks.
   const heightsEpoch = useRef(0);
 
   const [, forceRender] = useState(0);
   const scheduleRender = useCallback(() => forceRender((n) => n + 1), []);
 
-  // ── ResizeObserver on the sentinel ────────────────────────────────────────
+  // Sequential loader: controls which items may start fetching
+  const { allowedUpTo, markLoaded } = useSequentialLoader(media.length);
+
+  // ── ResizeObserver on sentinel ─────────────────────────────────────────────
   useEffect(() => {
     const el = sentinelRef.current;
     if (!el) return;
@@ -156,11 +208,9 @@ function MasonryGrid({ media }: MasonryGridProps) {
     const apply = (width: number) => {
       if (width <= 0) return;
       const cols = getColumnCount(width);
-
       setContainerWidth(width);
       setColumnCount((prev) => {
         if (prev !== cols) {
-          // Column count changed — measurements are no longer valid
           heights.current = new Map();
           heightsEpoch.current += 1;
           scheduleRender();
@@ -176,23 +226,25 @@ function MasonryGrid({ media }: MasonryGridProps) {
     );
 
     ro.observe(el);
-    // Read synchronously so the very first render already has real values
     apply(el.getBoundingClientRect().width);
 
     return () => ro.disconnect();
   }, [scheduleRender]);
 
-  // ── Height callback from probe items ──────────────────────────────────────
+  // ── Height + load callback ─────────────────────────────────────────────────
   const currentEpoch = heightsEpoch.current;
-  const handleHeight = useCallback(
-    (index: number, h: number, epoch: number) => {
-      if (epoch !== heightsEpoch.current) return; // stale measurement
-      if (heights.current.get(index) === h) return; // no change
-      heights.current.set(index, h);
-      scheduleRender();
+
+  const handleReady = useCallback(
+    (index: number, h: number) => {
+      if (heights.current.get(index) !== h) {
+        heights.current.set(index, h);
+        scheduleRender();
+      }
+      // Advance the sequential loader
+      markLoaded(index);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [scheduleRender]
+    [scheduleRender, markLoaded]
   );
 
   // ── Layout ────────────────────────────────────────────────────────────────
@@ -208,30 +260,23 @@ function MasonryGrid({ media }: MasonryGridProps) {
 
   const placedIndices = new Set(positions.map((p) => p.index));
 
+  // Probe items: not yet placed, but allowed to load (for height measurement)
   const probingIndices =
     colWidth > 0
-      ? media.map((_, i) => i).filter((i) => !placedIndices.has(i))
+      ? media.map((_, i) => i).filter((i) => !placedIndices.has(i) && i <= allowedUpTo)
       : [];
 
   return (
-    // Wrapper is position:relative so the absolute children are contained.
-    // It has real width from being a normal block element inside the page flow.
     <div style={{ position: "relative", width: "100%" }}>
 
-      {/* ── Sentinel: in-flow, full-width, zero-height ──────────────────────
-          The ResizeObserver watches THIS element for the container width.
-          It lives in the normal flow so the browser always gives it the
-          correct width — unlike fixed/absolute positioned elements.        */}
+      {/* Sentinel — gives ResizeObserver the real container width */}
       <div
         ref={sentinelRef}
         style={{ width: "100%", height: 0, overflow: "hidden" }}
         aria-hidden="true"
       />
 
-      {/* ── Probe container: off-screen, real column width ──────────────────
-          Items here are rendered at the exact column width they'll have in
-          the final layout so their natural aspect-ratio height is correct.
-          Uses the sentinel's measured colWidth, NOT 100%.                  */}
+      {/* Invisible probe area — items load here to get their height measured */}
       {probingIndices.length > 0 && colWidth > 0 && (
         <div
           aria-hidden="true"
@@ -245,30 +290,28 @@ function MasonryGrid({ media }: MasonryGridProps) {
             zIndex: -1,
           }}
         >
-          {probingIndices.map((i) => {
-            const epoch = currentEpoch;
-            return (
-              <MediaCard
-                key={`probe-${i}-${columnCount}`}
-                src={media[i]}
-                index={i}
-                onHeight={(idx, h) => handleHeight(idx, h, epoch)}
-              />
-            );
-          })}
+          {probingIndices.map((i) => (
+            <MediaCard
+              key={`probe-${i}-${columnCount}`}
+              src={media[i]}
+              index={i}
+              canLoad={i <= allowedUpTo}
+              onReady={handleReady}
+              visible={false}
+            />
+          ))}
         </div>
       )}
 
-      {/* ── Positioned masonry layout ──────────────────────────────────────── */}
+      {/* Positioned masonry layout — items appear only after fully loaded */}
       <div style={{ position: "relative", width: "100%", height: totalHeight }}>
         {positions.map((pos) => (
           <motion.div
             key={`item-${pos.index}-${columnCount}`}
-            initial={{ opacity: 0, y: 16 }}
+            initial={{ opacity: 0, y: 12 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{
-              duration: 0.4,
-              delay: Math.min(pos.index * 0.04, 0.6),
+              duration: 0.45,
               ease: [0.25, 0.46, 0.45, 0.94],
             }}
             style={{
@@ -283,7 +326,9 @@ function MasonryGrid({ media }: MasonryGridProps) {
             <MediaCard
               src={media[pos.index]}
               index={pos.index}
-              onHeight={(idx, h) => handleHeight(idx, h, currentEpoch)}
+              canLoad={pos.index <= allowedUpTo}
+              onReady={handleReady}
+              visible
             />
             <div
               className="absolute inset-0 rounded-md bg-black/0 group-hover:bg-black/20 transition-colors duration-300"

@@ -14,6 +14,7 @@ import { AdminDashboard } from "./pages/AdminDashboard";
 import { Gallery } from "./pages/Gallery";
 import { AdminGallery } from "./pages/AdminGallery";
 import { Services } from "./pages/ServicesPage";
+import { Rückgaberecht } from "./pages/Rückgaberecht";
 
 export const router = createBrowserRouter([
   {
@@ -76,6 +77,10 @@ export const router = createBrowserRouter([
       {
         path: "/services",
         element: <Services />,
+      },
+      {
+        path: "/rückgaberecht",
+        element: <Rückgaberecht />,
       }
     ],
   },

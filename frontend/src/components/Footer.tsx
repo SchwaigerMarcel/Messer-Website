@@ -72,6 +72,12 @@ export function Footer() {
                 Impressum
               </Link>
               <Link
+                to="/rückgaberecht"
+                className="text-neutral-400 hover:text-amber-500 transition-colors"
+              >
+                Rückgaberecht
+              </Link>
+              <Link
                 to="/datenschutz"
                 className="text-neutral-400 hover:text-amber-500 transition-colors"
               >
